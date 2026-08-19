@@ -1,13 +1,14 @@
 import os
 import re
+import math
 import streamlit as st
 
 
 def get_groq_client():
-    """Safely initializes and returns Groq client using secrets or env vars."""
+    """Extracts API key and initializes Groq client safely across environments."""
     api_key = None
     
-    # 1. Check Streamlit secrets
+    # 1. Streamlit Cloud secrets lookup
     try:
         if "GROQ_API_KEY" in st.secrets:
             api_key = str(st.secrets["GROQ_API_KEY"]).strip()
@@ -16,32 +17,49 @@ def get_groq_client():
     except Exception:
         pass
 
-    # 2. Check OS environment
+    # 2. Local environment fallback
     if not api_key:
         api_key = os.environ.get("GROQ_API_KEY", "").strip()
 
     if not api_key:
-        return None, "GROQ_API_KEY secret was not found in Streamlit Secrets or Environment."
+        return None, "GROQ_API_KEY was not found in Streamlit Secrets or Environment."
 
     try:
         from groq import Groq
-        client = Groq(api_key=api_key)
-        return client, None
+        return Groq(api_key=api_key), None
     except Exception as e:
-        return None, f"Failed to initialize Groq client: {e}"
+        return None, f"Groq initialization error: {e}"
 
 
-def run_groq_inference(system_instruction: str, user_prompt: str, temperature: float = 0.0) -> str:
-    """Queries Groq with official active production models."""
+def run_groq_inference(system_instruction: str, user_prompt: str, temperature: float = 0.1) -> str:
+    """Queries Groq by dynamically discovering available production models on your key."""
     client, err = get_groq_client()
     if err:
         return f"Configuration Error: {err}"
 
-    # Active production Groq models
-    active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-    
-    last_err = ""
-    for model_id in active_models:
+    # Default production models prioritized by availability
+    candidate_models = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+        "llama3-70b-8192",
+        "llama3-8b-8192"
+    ]
+
+    # Dynamically detect active models permitted on your specific Groq key
+    try:
+        active_key_models = [
+            m.id for m in client.models.list().data 
+            if not any(x in m.id for x in ["whisper", "guard", "vision", "embed"])
+        ]
+        if active_key_models:
+            candidate_models = active_key_models + candidate_models
+    except Exception:
+        pass
+
+    last_error = ""
+    for model_id in candidate_models:
         try:
             completion = client.chat.completions.create(
                 model=model_id,
@@ -51,34 +69,90 @@ def run_groq_inference(system_instruction: str, user_prompt: str, temperature: f
                 ],
                 temperature=temperature
             )
-            return completion.choices[0].message.content
+            return completion.choices[0].message.content.strip()
         except Exception as e:
-            last_err = str(e)
+            last_error = str(e)
             continue
 
-    return f"Cloud Inference Error: {last_err}"
+    return f"Cloud Inference Error: {last_error}"
 
 
-def solve_algebra_equation(query: str):
-    """Deterministic linear equation solver for patterns like '3x+5=20' or '2x - 4 = 10'."""
-    q = query.lower().replace("solve", "").replace("for x", "").replace(" ", "")
-    if "=" in q:
-        # Match pattern: [+-]?ax [+-] b = c
-        match = re.match(r"^([+-]?\d*)x([+-]\d+)?=([+-]?\d+)$", q)
-        if match:
-            a_str, b_str, c_str = match.groups()
-            a = 1 if a_str in ("", "+") else (-1 if a_str == "-" else int(a_str))
-            b = int(b_str) if b_str else 0
-            c = int(c_str)
-            x_val = (c - b) / a
-            step = f"1. Given: {a}x + ({b}) = {c}\n2. Subtract {b} from both sides: {a}x = {c - b}\n3. Divide by {a}: **x = {x_val:g}**"
-            return f"Algebra Solution (Local Python Symbolic Engine):\n\n{step}"
+# ==========================================
+# LOCAL ZERO-COST MATH COMPUTATION ENGINES
+# ==========================================
+
+def solve_algebraic_equation(query: str):
+    """Solves linear equations like 3x+5=20, 2x-8=10, 4x=100, x/2=15."""
+    clean = query.lower().replace("solve", "").replace("for x", "").replace("find x", "").replace(" ", "")
+    if "=" in clean:
+        parts = clean.split("=")
+        if len(parts) == 2:
+            left, right = parts[0], parts[1]
+            # Match standard ax + b = c pattern
+            match = re.match(r"^([+-]?\d*(?:\.\d+)?)x([+-]\d+(?:\.\d+)?)?$", left)
+            if match and re.match(r"^[+-]?\d+(?:\.\d+)?$", right):
+                a_str, b_str = match.groups()
+                a = 1.0 if a_str in ("", "+") else (-1.0 if a_str == "-" else float(a_str))
+                b = float(b_str) if b_str else 0.0
+                c = float(right)
+                
+                if a != 0:
+                    x_val = (c - b) / a
+                    x_formatted = int(x_val) if x_val.is_integer() else round(x_val, 4)
+                    return (
+                        f"**Algebraic Solution (Local Symbolic Solver)**\n\n"
+                        f"1. Given Equation: `{a:g}x + ({b:g}) = {c:g}`\n"
+                        f"2. Isolate variable: `{a:g}x = {c - b:g}`\n"
+                        f"3. Divide by coefficient: **x = {x_formatted}**"
+                    )
     return None
 
 
+def calculate_general_math(query: str):
+    """Evaluates arithmetic, powers, roots, percentages, and natural language math."""
+    q = query.lower().strip()
+    
+    # Strip common conversational math question prefixes
+    for prefix in ["what is", "calculate", "compute", "how much is", "evaluate", "value of", "solve", "?", "!"]:
+        q = q.replace(prefix, "")
+
+    # Natural language operator normalization
+    replacements = {
+        "multiplied by": "*", "times": "*", "into": "*", "x": "*",
+        "divided by": "/", "over": "/", "by": "/",
+        "plus": "+", "add": "+", "added to": "+",
+        "minus": "-", "subtract": "-", "subtracted from": "-",
+        "power of": "**", "power": "**", "^": "**",
+        "squared": "**2", "cubed": "**3",
+        "percent of": "/100*", "percentage of": "/100*", "% of": "/100*"
+    }
+    for word, sym in replacements.items():
+        q = q.replace(word, sym)
+
+    # Square root support: "sqrt(144)" or "sqrt 144"
+    if "sqrt" in q:
+        q = re.sub(r"sqrt\s*\(?(\d+(?:\.\d+)?)\)?", r"math.sqrt(\1)", q)
+
+    allowed_chars = set("0123456789+-*/(). %math.sqrt")
+    clean_q = "".join(c for c in q if c in allowed_chars).strip()
+
+    if clean_q and any(c.isdigit() for c in clean_q):
+        try:
+            safe_scope = {"__builtins__": None, "math": math}
+            result = eval(clean_q, safe_scope, {})
+            formatted_res = int(result) if isinstance(result, float) and result.is_integer() else round(result, 4)
+            return f"Calculated Result (Deterministic Python Core): **{formatted_res}**"
+        except Exception:
+            return None
+    return None
+
+
+# ==========================================
+# CLASSIFICATION & ROUTING SWITCH
+# ==========================================
+
 def call_model_switch(system_instruction: str, user_prompt: str, temperature: float = 0.0) -> str:
-    """Attempts local Ollama first; automatically falls back to Groq Cloud."""
-    # 1. Local Ollama Attempt
+    """Routes to local Ollama if active; otherwise fails over to Groq Cloud."""
     try:
         import ollama
         res = ollama.chat(
@@ -94,20 +168,24 @@ def call_model_switch(system_instruction: str, user_prompt: str, temperature: fl
     except Exception:
         pass
 
-    # 2. Groq Cloud Fallback
     return run_groq_inference(system_instruction, user_prompt, temperature)
 
 
 def classify_user_intent(user_query: str) -> str:
-    """Deterministic intent classification."""
+    """Fast deterministic intent categorizer."""
     q = user_query.strip().lower()
 
+    # 1. Greetings Gate
     greetings = {"hello", "hi", "hey", "good morning", "good evening", "howdy", "sup", "greetings"}
-    if q in greetings or any(q.startswith(g + " ") for g in greetings):
+    if q in greetings or any(q.startswith(g + " ") for g in greetings) or any(q == g for g in greetings):
         return "GREETING"
 
-    math_indicators = ["solve", "calculate", "+", "-", "*", "/", "=", "^", "sqrt"]
-    if any(ind in q for ind in math_indicators) and any(char.isdigit() for char in q):
+    # 2. Math Gate (Words, numbers, or symbols)
+    math_signals = [
+        "+", "-", "*", "/", "=", "^", "%", "sqrt", "solve", "calculate", "compute",
+        "times", "plus", "minus", "divided", "multiply", "algebra", "equation", "integral", "derivative"
+    ]
+    if any(sig in q for sig in math_signals) and any(char.isdigit() for char in q):
         return "MATH"
 
     return "GENERAL"
@@ -117,37 +195,30 @@ def process_query_through_route(category: str, user_query: str):
     """Executes deterministic code engine or generative LLM handoff."""
     if category == "GREETING":
         execution_log = "⚡ Fast-Track Route Triggered: [Static Response Engine]"
-        final_answer = "Hello there! I am your agentic router switch bot. How can I direct your computational inquiries today? 👋"
+        final_answer = "Hello! I am your agentic router switch bot. How can I direct your computational inquiries today? 👋"
         return execution_log, final_answer
 
     elif category == "MATH":
         # 1. Check for linear algebraic equations (e.g. solve 3x+5=20)
-        algebra_solution = solve_algebra_equation(user_query)
-        if algebra_solution:
+        algebra_res = solve_algebraic_equation(user_query)
+        if algebra_res:
             execution_log = "🐍 Functional Route Triggered: [Local Symbolic Equation Core]"
-            return execution_log, algebra_solution
+            return execution_log, algebra_res
 
-        # 2. Check for standard arithmetic expressions
-        try:
-            clean_query = user_query.lower().replace("what is", "").replace("calculate", "").replace("?", "").strip()
-            clean_query = clean_query.replace("x", "*").replace("times", "*").replace("divided by", "/")
-            allowed_chars = set("0123456789+-*/(). %")
-            if all(c in allowed_chars for c in clean_query) and any(c.isdigit() for c in clean_query):
-                calculated_result = eval(clean_query, {"__builtins__": None}, {})
-                execution_log = "🐍 Functional Route Triggered: [Local Python Evaluator Math Core]"
-                final_answer = f"The programmatic python calculation result equals: **{calculated_result}**"
-                return execution_log, final_answer
-        except Exception:
-            pass
+        # 2. Check for arithmetic and natural language calculations (e.g. 125 times 5, 25% of 800, sqrt 144)
+        general_math_res = calculate_general_math(user_query)
+        if general_math_res:
+            execution_log = "🐍 Functional Route Triggered: [Local Python Evaluator Math Core]"
+            return execution_log, general_math_res
 
-        # 3. Smart Handoff: Re-route complex word problems to LLM
-        execution_log = "🧠 Intelligent Handoff Triggered: [Python Parse Failed -> Re-routed to Full LLM Reasoning]"
-        system_instruction = "You are an expert mathematical assistant. Solve the math problem clearly and step-by-step."
+        # 3. Smart Fallback for complex word problems, proofs, or calculus
+        execution_log = "🧠 Intelligent Handoff Triggered: [Complex Query -> Re-routed to Deep Reasoning LLM]"
+        system_instruction = "You are an expert mathematical and analytical reasoning engine. Solve the problem thoroughly with clear, step-by-step mathematical logic."
         final_answer = call_model_switch(system_instruction, user_query, temperature=0.1)
         return execution_log, final_answer
 
     else:
         execution_log = "🧠 Deep Reasoning Route Triggered: [Llama Full Generative Core]"
-        system_instruction = "You are a helpful knowledge assistant. Answer the question completely and factually."
+        system_instruction = "You are a helpful knowledge and analytical reasoning assistant. Answer questions clearly, accurately, and thoroughly."
         final_answer = call_model_switch(system_instruction, user_query, temperature=0.2)
         return execution_log, final_answer
